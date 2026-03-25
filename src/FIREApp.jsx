@@ -116,9 +116,9 @@ function calcCoastFIRE({ age, netWorth, spending, annualContributions, growth, s
   return { data, coastAge, fireNumber, todayCoastNumber };
 }
 
-// --- Monte Carlo simulation (bootstrap from historical S&P 500 returns) ---
+// --- Monte Carlo simulation (bootstrap from historical nominal S&P 500 returns) ---
 function runMonteCarlo({ age, netWorth, spending, annualContributions, inflation, swr, simCount, maxAge = 90 }) {
-  const fireNumber = spending / (swr / 100);
+  const inflationRate = inflation / 100;
   const years = maxAge - age;
   const netWorths = Array.from({ length: years + 1 }, () => []);
   let successCount = 0;
@@ -127,22 +127,22 @@ function runMonteCarlo({ age, netWorth, spending, annualContributions, inflation
   for (let sim = 0; sim < simCount; sim++) {
     let nw = netWorth;
     let fired = false;
-    let fireYr = null;
     let ruined = false;
 
     for (let yr = 0; yr <= years; yr++) {
       netWorths[yr].push(Math.max(0, nw));
       const ret = HISTORICAL_RETURNS[Math.floor(Math.random() * HISTORICAL_RETURNS.length)];
+      const spendingThisYear = spending * Math.pow(1 + inflationRate, yr);
+      const fireNumberThisYear = spendingThisYear / (swr / 100);
 
-      if (!fired && nw >= fireNumber) { fired = true; fireYr = yr; }
+      if (!fired && nw >= fireNumberThisYear) fired = true;
 
       let newNw;
       if (!fired) {
-        newNw = nw * (1 + ret) + annualContributions;
+        const contributionThisYear = annualContributions * Math.pow(1 + inflationRate, yr);
+        newNw = nw * (1 + ret) + contributionThisYear;
       } else {
-        const yrsRetired = yr - fireYr;
-        const realSpending = spending * Math.pow(1 + inflation / 100, yrsRetired);
-        newNw = nw * (1 + ret) - realSpending;
+        newNw = nw * (1 + ret) - spendingThisYear;
       }
 
       if (fired && newNw <= 0 && !ruined) ruined = true;
@@ -159,16 +159,52 @@ function runMonteCarlo({ age, netWorth, spending, annualContributions, inflation
     const s = [...values].sort((a, b) => a - b);
     const n = s.length;
     const p  = (q) => s[Math.floor(n * q)];
+    const fireNumber = (spending * Math.pow(1 + inflationRate, yr)) / (swr / 100);
     return {
       age: age + yr,
+      fireNumber,
       p5: p(0.05), p10: p(0.10), p25: p(0.25),
       p50: p(0.50), p75: p(0.75), p95: p(0.95),
     };
   });
 
-  const successRate = fireReachedCount > 0 ? successCount / fireReachedCount : 0;
-  const fireReachedRate = fireReachedCount / simCount;
-  return { percentileData, successRate, fireReachedRate };
+  const overallSuccessRate = successCount / simCount;
+  const reachFireRate = fireReachedCount / simCount;
+  const surviveAfterFireRate = fireReachedCount > 0 ? successCount / fireReachedCount : 0;
+  return { percentileData, overallSuccessRate, reachFireRate, surviveAfterFireRate };
+}
+
+// --- Coast Monte Carlo simulation ---
+function runCoastMonteCarlo({ age, netWorth, spending, annualContributions, growth, swr, retirementAge, simCount }) {
+  const fireNumber = spending / (swr / 100);
+  const years = retirementAge - age;
+  const netWorths = Array.from({ length: years + 1 }, () => []);
+  let successCount = 0;
+
+  for (let sim = 0; sim < simCount; sim++) {
+    let nw = netWorth;
+    let coasted = false;
+
+    for (let yr = 0; yr <= years; yr++) {
+      netWorths[yr].push(Math.max(0, nw));
+      const ret = HISTORICAL_RETURNS[Math.floor(Math.random() * HISTORICAL_RETURNS.length)];
+      const yearsLeft = retirementAge - (age + yr);
+      const coastNumber = yearsLeft > 0 ? fireNumber / Math.pow(1 + growth / 100, yearsLeft) : fireNumber;
+      if (!coasted && nw >= coastNumber) coasted = true;
+      nw = Math.max(0, nw * (1 + ret) + (coasted ? 0 : annualContributions));
+    }
+
+    if (nw >= fireNumber) successCount++;
+  }
+
+  const percentileData = netWorths.map((values, yr) => {
+    const s = [...values].sort((a, b) => a - b);
+    const n = s.length;
+    const p = (q) => s[Math.floor(n * q)];
+    return { age: age + yr, p5: p(0.05), p10: p(0.10), p25: p(0.25), p50: p(0.50), p75: p(0.75), p95: p(0.95) };
+  });
+
+  return { percentileData, successRate: successCount / simCount };
 }
 
 // --- localStorage ---
@@ -310,6 +346,11 @@ const ChartTooltip = ({ active, payload, label, t, mcMode, mcData, mcPercentiles
     return (
       <div style={{ background: t.tooltipBg, border: `1px solid ${t.borderStrong}`, borderRadius: 8, padding: "12px 16px", fontSize: 12, fontFamily: "'DM Mono', monospace" }}>
         <div style={{ color: t.textMuted, marginBottom: 8 }}>Age {label}</div>
+        {typeof pt.fireNumber === "number" && (
+          <div style={{ color: t.purple, marginBottom: 6 }}>
+            FIRE target  {fmt(pt.fireNumber)}
+          </div>
+        )}
         {visible.map((p) => (
           <div key={p} style={{ color: p === 50 ? (payload[0]?.color || t.accent) : p >= 50 ? t.textFaint : t.textVeryFaint, fontWeight: p === 50 ? 700 : 400, marginBottom: 3 }}>
             {p === 50 ? "Median" : `${p}th`}{"  "}{fmt(pt[`p${p}`] || 0)}
@@ -403,6 +444,18 @@ export default function FIREApp() {
   const activeCoastResult = allCoastResults.find((s) => s.name === activeUser.activeScenario);
   const { coastAge, todayCoastNumber, fireNumber: coastFireNumber } = activeCoastResult;
   const yearsToCoast = coastAge ? coastAge - activeParams.age : null;
+
+  const coastMcResults = useMemo(() => {
+    if (!showMC) return null;
+    return runCoastMonteCarlo({
+      age: activeParams.age, netWorth: activeParams.netWorth,
+      spending: activeParams.spending, annualContributions: activeParams.annualContributions,
+      growth: activeParams.growth, swr: activeParams.swr,
+      retirementAge: activeParams.retirementAge, simCount: mcSimCount,
+    });
+  }, [showMC, activeParams.age, activeParams.netWorth, activeParams.spending,
+      activeParams.annualContributions, activeParams.growth, activeParams.swr,
+      activeParams.retirementAge, mcSimCount]);
 
   const coastChartData = useMemo(() => {
     const byAge = {};
@@ -586,53 +639,147 @@ export default function FIREApp() {
                   <StatCard label="Coast Age" value={coastAge ? `${coastAge}` : "—"} sub={yearsToCoast != null ? (yearsToCoast <= 0 ? "Already coasting!" : `${yearsToCoast} years away`) : "Not reached"} accent={t.blue} t={t} tooltip="The age at which you can stop making contributions entirely. After this point, investment growth alone is projected to carry your portfolio to your full FIRE Number by your retirement age." />
                   <StatCard label="Coast Number (Today)" value={fmt(todayCoastNumber)} sub={`to retire at ${activeParams.retirementAge}`} accent={t.accent} t={t} tooltip={`The lump sum you need invested right now so that, with zero future contributions, it grows to your FIRE Number by retirement. Formula: FIRE Number ÷ (1 + growth)^years to retirement.`} />
                   <StatCard label="FIRE Number" value={fmt(coastFireNumber)} sub={`at ${activeParams.swr}% SWR`} accent={t.green} t={t} tooltip={`The total portfolio size needed to retire. Formula: Annual Spending ÷ Safe Withdrawal Rate. At a ${activeParams.swr}% SWR, your portfolio can sustain withdrawals indefinitely if it grows faster than you spend.`} />
-                  <StatCard label="Progress" value={todayCoastNumber > 0 ? `${Math.min(100, Math.round((activeParams.netWorth / todayCoastNumber) * 100))}%` : "—"} sub="of coast number" accent={activeParams.netWorth >= todayCoastNumber ? t.green : t.purple} t={t} tooltip="Your current net worth as a percentage of your Coast Number. At 100% you've hit your coast target — you can stop contributing and let compound growth do the rest." />
+                  {showMC && coastMcResults ? (
+                    <StatCard label="MC Success Rate" value={`${Math.round(coastMcResults.successRate * 100)}%`} sub={`${mcSimCount.toLocaleString()} simulations · reach FIRE at retirement`} accent={successRateColor(coastMcResults.successRate)} t={t} tooltip="The percentage of simulated historical return sequences where your portfolio reaches your full FIRE Number by retirement age. Uses bootstrap resampling of S&P 500 returns from 1928–2024." />
+                  ) : (
+                    <StatCard label="Progress" value={todayCoastNumber > 0 ? `${Math.min(100, Math.round((activeParams.netWorth / todayCoastNumber) * 100))}%` : "—"} sub="of coast number" accent={activeParams.netWorth >= todayCoastNumber ? t.green : t.purple} t={t} tooltip="Your current net worth as a percentage of your Coast Number. At 100% you've hit your coast target — you can stop contributing and let compound growth do the rest." />
+                  )}
                 </div>
 
                 <div style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: 16, padding: "24px 16px 12px", flex: 1 }}>
-                  <div style={{ fontSize: 10, letterSpacing: "0.2em", textTransform: "uppercase", color: t.textVeryFaint, marginBottom: 20, paddingLeft: 8 }}>Coast FI Trajectory</div>
-                  <ResponsiveContainer width="100%" height={320}>
-                    <AreaChart data={coastChartData} margin={{ top: 30, right: 16, bottom: 0, left: 10 }}>
-                      <defs>
-                        {allCoastResults.map(({ name, color }) => (
-                          <linearGradient key={name} id={`cgrad-${name.replace(/\s+/g, "")}`} x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor={color} stopOpacity={0.15} />
-                            <stop offset="95%" stopColor={color} stopOpacity={0} />
-                          </linearGradient>
-                        ))}
-                        <linearGradient id="coastLineGrad" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor={t.purple} stopOpacity={0.08} />
-                          <stop offset="95%" stopColor={t.purple} stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke={t.divider} vertical={false} />
-                      <XAxis dataKey="age" tick={{ fill: t.textVeryFaint, fontSize: 11, fontFamily: "'DM Mono', monospace" }} axisLine={{ stroke: t.border }} tickLine={false} label={{ value: "Age", position: "insideBottomRight", offset: -8, fill: t.textVeryFaint, fontSize: 11 }} />
-                      <YAxis tickFormatter={(v) => fmt(v)} tick={{ fill: t.textVeryFaint, fontSize: 10, fontFamily: "'DM Mono', monospace" }} axisLine={false} tickLine={false} width={70} />
-                      <Tooltip content={<ChartTooltip t={t} />} />
-                      {coastAge && <ReferenceLine x={coastAge} stroke={t.blue} strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `Coast ${coastAge}`, fill: t.blue, fontSize: 10, fontFamily: "'DM Mono', monospace", position: "top" }} />}
-                      <ReferenceLine x={activeParams.retirementAge} stroke={t.green} strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `Retire ${activeParams.retirementAge}`, fill: t.green, fontSize: 10, fontFamily: "'DM Mono', monospace", position: "top" }} />
-                      <Area type="monotone" dataKey="Coast Number" stroke={t.purple} strokeWidth={1.5} strokeDasharray="6 4" fill="url(#coastLineGrad)" dot={false} />
-                      {allCoastResults.map(({ name, color }) => (
-                        <Area key={name} type="monotone" dataKey={`${name} Net Worth`} stroke={color} strokeWidth={name === activeUser.activeScenario ? 2.5 : 1.5} strokeOpacity={name === activeUser.activeScenario ? 1 : 0.45} fill={`url(#cgrad-${name.replace(/\s+/g, "")})`} dot={false} name={`${name} Net Worth`} />
-                      ))}
-                    </AreaChart>
-                  </ResponsiveContainer>
-                  <div style={{ display: "flex", gap: 16, paddingLeft: 16, marginTop: 8, flexWrap: "wrap" }}>
-                    {allCoastResults.map(({ name, color }) => (
-                      <div key={name} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <div style={{ width: 20, height: 2, background: color, borderRadius: 1, opacity: name === activeUser.activeScenario ? 1 : 0.4 }} />
-                        <span style={{ fontSize: 10, color: name === activeUser.activeScenario ? t.textMuted : t.textVeryFaint, letterSpacing: "0.05em" }}>{name}</span>
-                      </div>
-                    ))}
-                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <div style={{ width: 20, height: 2, background: `repeating-linear-gradient(to right, ${t.purple} 0, ${t.purple} 4px, transparent 4px, transparent 8px)`, borderRadius: 1 }} />
-                      <span style={{ fontSize: 10, color: t.textFaint, letterSpacing: "0.05em" }}>Coast Number</span>
+                  {/* Chart header with MC toggle */}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingLeft: 8, marginBottom: 20 }}>
+                    <div style={{ fontSize: 10, letterSpacing: "0.2em", textTransform: "uppercase", color: t.textVeryFaint }}>
+                      Coast FI Trajectory
                     </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      {showMC && (
+                        <div style={{ display: "flex", background: t.panelAlt, border: `1px solid ${t.border}`, borderRadius: 8, overflow: "hidden" }}>
+                          {[500, 1000, 5000].map((n) => (
+                            <button key={n} className="tab-btn" onClick={() => setMcSimCount(n)}
+                              style={{ padding: "4px 10px", fontSize: 10, fontFamily: "'DM Mono', monospace",
+                                color: mcSimCount === n ? t.tabActiveTextDark : t.textVeryFaint,
+                                background: mcSimCount === n ? t.accent : "transparent",
+                                borderRight: n !== 5000 ? `1px solid ${t.border}` : "none" }}>
+                              {n.toLocaleString()}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <button className="tab-btn" onClick={() => setShowMC(!showMC)}
+                        style={{ padding: "5px 12px", borderRadius: 8, fontSize: 11, fontWeight: 600, letterSpacing: "0.05em",
+                          color: showMC ? t.tabActiveTextDark : t.textFaint,
+                          background: showMC ? t.green : "transparent",
+                          border: `1px solid ${showMC ? t.green : t.borderAlt}` }}>
+                        Monte Carlo
+                      </button>
+                    </div>
+                  </div>
+
+                  <ResponsiveContainer width="100%" height={320}>
+                    {showMC && coastMcResults ? (
+                      <AreaChart data={coastMcResults.percentileData} margin={{ top: 30, right: 16, bottom: 0, left: 10 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={t.divider} vertical={false} />
+                        <XAxis dataKey="age" tick={{ fill: t.textVeryFaint, fontSize: 11, fontFamily: "'DM Mono', monospace" }} axisLine={{ stroke: t.border }} tickLine={false} label={{ value: "Age", position: "insideBottomRight", offset: -8, fill: t.textVeryFaint, fontSize: 11 }} />
+                        <YAxis tickFormatter={(v) => fmt(v)} tick={{ fill: t.textVeryFaint, fontSize: 10, fontFamily: "'DM Mono', monospace" }} axisLine={false} tickLine={false} width={70} />
+                        <Tooltip content={<ChartTooltip t={t} mcMode={true} mcData={coastMcResults.percentileData} mcPercentiles={mcPercentiles} />} />
+                        {coastAge && <ReferenceLine x={coastAge} stroke={t.blue} strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `Coast ${coastAge}`, fill: t.blue, fontSize: 10, fontFamily: "'DM Mono', monospace", position: "top" }} />}
+                        <ReferenceLine x={activeParams.retirementAge} stroke={t.green} strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `Retire ${activeParams.retirementAge}`, fill: t.green, fontSize: 10, fontFamily: "'DM Mono', monospace", position: "top" }} />
+                        {[5, 10, 25, 50, 75, 95].filter((p) => mcPercentiles.includes(p)).map((p) => (
+                          <Area
+                            key={p}
+                            type="monotone"
+                            dataKey={`p${p}`}
+                            fill="none"
+                            stroke={t.blue}
+                            strokeWidth={p === 50 ? 2.5 : 1}
+                            strokeOpacity={p === 50 ? 1 : p === 25 || p === 75 ? 0.55 : 0.3}
+                            strokeDasharray={p === 50 ? undefined : "4 3"}
+                            dot={false}
+                            name={p === 50 ? "Median (p50)" : `p${p}`}
+                          />
+                        ))}
+                      </AreaChart>
+                    ) : (
+                      <AreaChart data={coastChartData} margin={{ top: 30, right: 16, bottom: 0, left: 10 }}>
+                        <defs>
+                          {allCoastResults.map(({ name, color }) => (
+                            <linearGradient key={name} id={`cgrad-${name.replace(/\s+/g, "")}`} x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor={color} stopOpacity={0.15} />
+                              <stop offset="95%" stopColor={color} stopOpacity={0} />
+                            </linearGradient>
+                          ))}
+                          <linearGradient id="coastLineGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor={t.purple} stopOpacity={0.08} />
+                            <stop offset="95%" stopColor={t.purple} stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke={t.divider} vertical={false} />
+                        <XAxis dataKey="age" tick={{ fill: t.textVeryFaint, fontSize: 11, fontFamily: "'DM Mono', monospace" }} axisLine={{ stroke: t.border }} tickLine={false} label={{ value: "Age", position: "insideBottomRight", offset: -8, fill: t.textVeryFaint, fontSize: 11 }} />
+                        <YAxis tickFormatter={(v) => fmt(v)} tick={{ fill: t.textVeryFaint, fontSize: 10, fontFamily: "'DM Mono', monospace" }} axisLine={false} tickLine={false} width={70} />
+                        <Tooltip content={<ChartTooltip t={t} />} />
+                        {coastAge && <ReferenceLine x={coastAge} stroke={t.blue} strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `Coast ${coastAge}`, fill: t.blue, fontSize: 10, fontFamily: "'DM Mono', monospace", position: "top" }} />}
+                        <ReferenceLine x={activeParams.retirementAge} stroke={t.green} strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `Retire ${activeParams.retirementAge}`, fill: t.green, fontSize: 10, fontFamily: "'DM Mono', monospace", position: "top" }} />
+                        <Area type="monotone" dataKey="Coast Number" stroke={t.purple} strokeWidth={1.5} strokeDasharray="6 4" fill="url(#coastLineGrad)" dot={false} />
+                        {allCoastResults.map(({ name, color }) => (
+                          <Area key={name} type="monotone" dataKey={`${name} Net Worth`} stroke={color} strokeWidth={name === activeUser.activeScenario ? 2.5 : 1.5} strokeOpacity={name === activeUser.activeScenario ? 1 : 0.45} fill={`url(#cgrad-${name.replace(/\s+/g, "")})`} dot={false} name={`${name} Net Worth`} />
+                        ))}
+                      </AreaChart>
+                    )}
+                  </ResponsiveContainer>
+
+                  <div style={{ display: "flex", gap: 16, paddingLeft: 16, marginTop: 8, flexWrap: "wrap" }}>
+                    {showMC && coastMcResults ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 10, color: t.textVeryFaint, letterSpacing: "0.1em", textTransform: "uppercase", marginRight: 4 }}>Percentiles</span>
+                        {[5, 10, 25, 50, 75, 95].map((p) => {
+                          const active = mcPercentiles.includes(p);
+                          const toggle = () => setMcPercentiles((prev) =>
+                            active && prev.length > 1 ? prev.filter((x) => x !== p) : active ? prev : [...prev, p]
+                          );
+                          return (
+                            <button key={p} onClick={toggle} style={{
+                              padding: "2px 8px", borderRadius: 20, border: `1px solid ${active ? t.blue : t.border}`,
+                              background: active ? `${t.blue}22` : "transparent",
+                              color: active ? t.blue : t.textVeryFaint,
+                              fontSize: 10, cursor: "pointer", fontFamily: "'DM Mono', monospace",
+                              letterSpacing: "0.05em", transition: "all 0.15s",
+                            }}>
+                              {p === 50 ? "50% (med)" : `${p}%`}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <>
+                        {allCoastResults.map(({ name, color }) => (
+                          <div key={name} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <div style={{ width: 20, height: 2, background: color, borderRadius: 1, opacity: name === activeUser.activeScenario ? 1 : 0.4 }} />
+                            <span style={{ fontSize: 10, color: name === activeUser.activeScenario ? t.textMuted : t.textVeryFaint, letterSpacing: "0.05em" }}>{name}</span>
+                          </div>
+                        ))}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <div style={{ width: 20, height: 2, background: `repeating-linear-gradient(to right, ${t.purple} 0, ${t.purple} 4px, transparent 4px, transparent 8px)`, borderRadius: 1 }} />
+                          <span style={{ fontSize: 10, color: t.textFaint, letterSpacing: "0.05em" }}>Coast Number</span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div style={{ paddingLeft: 16, paddingRight: 16, marginTop: 16 }}>
+                    <Slider label="Max Age" value={maxAge} min={55} max={100} step={1} onChange={setMaxAge} format={(v) => `${v} yrs`} color={t.textMuted} t={t} />
                   </div>
                 </div>
 
                 <div style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: 12, padding: "16px 20px", fontSize: 13, color: t.textFaint, fontStyle: "italic", lineHeight: 1.7 }}>
-                  {activeParams.netWorth >= todayCoastNumber ? (
+                  {showMC && coastMcResults ? (
+                    <>
+                      Based on {mcSimCount.toLocaleString()} simulations using historical S&P 500 returns (1928–2024),{" "}
+                      <span style={{ color: successRateColor(coastMcResults.successRate), fontStyle: "normal", fontWeight: 700 }}>{Math.round(coastMcResults.successRate * 100)}%</span>{" "}
+                      of paths reached a full FIRE portfolio of <span style={{ color: t.green, fontStyle: "normal", fontWeight: 700 }}>{fmt(coastFireNumber)}</span> by retirement age {activeParams.retirementAge}.{" "}
+                      {coastMcResults.successRate >= 0.9 ? "Your coast plan is historically robust." : coastMcResults.successRate >= 0.75 ? "Consider increasing contributions or adjusting your retirement age to improve resilience." : "Your plan may fall short in many historical scenarios — consider increasing contributions or growth assumptions."}
+                    </>
+                  ) : activeParams.netWorth >= todayCoastNumber ? (
                     <>You've already reached your Coast FI number of <span style={{ color: t.accent, fontStyle: "normal", fontWeight: 700 }}>{fmt(todayCoastNumber)}</span>. You can stop contributing and your portfolio is projected to grow to <span style={{ color: t.green, fontStyle: "normal", fontWeight: 700 }}>{fmt(coastFireNumber)}</span> by age {activeParams.retirementAge}.</>
                   ) : coastAge ? (
                     <>At your current contribution rate, you'll reach Coast FI at age <span style={{ color: t.blue, fontStyle: "normal", fontWeight: 700 }}>{coastAge}</span> — {yearsToCoast} years from now. After that, your portfolio can grow to <span style={{ color: t.green, fontStyle: "normal", fontWeight: 700 }}>{fmt(coastFireNumber)}</span> by age {activeParams.retirementAge} without further contributions.</>
@@ -650,12 +797,12 @@ export default function FIREApp() {
                   <StatCard label="Portfolio Runway" value={runway !== null ? (runway === "∞" ? "∞" : `${runway} yrs`) : "—"} sub={ruinAge ? `Depleted at age ${ruinAge}` : runway === "∞" ? "Never depleted" : ""} accent={ruinAge ? t.orange : t.blue} t={t} tooltip={`How long your portfolio lasts after reaching FIRE before being drawn down to zero. "∞" means your real portfolio growth rate exceeds your withdrawal rate — it never depletes. Affected by spending, growth rate, and inflation.`} />
                   {showMC && mcResults ? (
                     <StatCard
-                      label="MC Success Rate"
-                      value={`${Math.round(mcResults.successRate * 100)}%`}
-                      sub={`${mcSimCount.toLocaleString()} simulations · historical returns`}
-                      accent={successRateColor(mcResults.successRate)}
+                      label="MC Plan Success"
+                      value={`${Math.round(mcResults.overallSuccessRate * 100)}%`}
+                      sub={`${Math.round(mcResults.reachFireRate * 100)}% reach FIRE · ${Math.round(mcResults.surviveAfterFireRate * 100)}% survive after FIRE`}
+                      accent={successRateColor(mcResults.overallSuccessRate)}
                       t={t}
-                      tooltip={`The percentage of simulated historical market sequences where your portfolio survived the full projection window. Uses bootstrap resampling of real S&P 500 annual returns from 1928–2024. Higher is better; 90%+ is generally considered safe.`}
+                      tooltip={`Overall success is the percentage of all simulated paths that both reached FIRE and stayed above zero through the full projection window. Reach FIRE is tracked separately, and survive after FIRE measures only the paths that made it to retirement. Uses bootstrap resampling of nominal S&P 500 annual returns from 1928–2024 with inflation-adjusted contributions, withdrawals, and FIRE targets.`}
                     />
                   ) : (
                     <StatCard label="Real Spending" value={fmt(activeParams.spending * Math.pow(1 + activeParams.inflation / 100, yearsToFire || 0))} sub="at retirement (inflation adj.)" accent={t.purple} t={t} tooltip={`Your current annual spending adjusted for ${activeParams.inflation}% inflation by the time you reach FIRE. Formula: $${(activeParams.spending / 1000).toFixed(0)}K × (1 + ${activeParams.inflation}%)^${yearsToFire || 0} years. This is the actual annual amount you'll need to withdraw in retirement.`} />
@@ -701,6 +848,7 @@ export default function FIREApp() {
                         <YAxis tickFormatter={(v) => fmt(v)} tick={{ fill: t.textVeryFaint, fontSize: 10, fontFamily: "'DM Mono', monospace" }} axisLine={false} tickLine={false} width={70} />
                         <Tooltip content={<ChartTooltip t={t} mcMode={true} mcData={mcResults.percentileData} mcPercentiles={mcPercentiles} />} />
                         {fireAge && <ReferenceLine x={fireAge} stroke={activeColor} strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `FIRE ${fireAge}`, fill: activeColor, fontSize: 10, fontFamily: "'DM Mono', monospace", position: "top" }} />}
+                        <Area type="monotone" dataKey="fireNumber" stroke={t.purple} strokeWidth={1.5} strokeDasharray="6 4" fill="none" dot={false} name="FIRE Target" />
                         {[5, 10, 25, 50, 75, 95].filter((p) => mcPercentiles.includes(p)).map((p) => (
                           <Area
                             key={p}
@@ -743,6 +891,10 @@ export default function FIREApp() {
                   <div style={{ display: "flex", gap: 16, paddingLeft: 16, marginTop: 8, flexWrap: "wrap" }}>
                     {showMC && mcResults ? (
                       <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 10 }}>
+                          <div style={{ width: 20, height: 2, background: `repeating-linear-gradient(to right, ${t.purple} 0, ${t.purple} 4px, transparent 4px, transparent 8px)`, borderRadius: 1 }} />
+                          <span style={{ fontSize: 10, color: t.textFaint, letterSpacing: "0.05em" }}>FIRE Target</span>
+                        </div>
                         <span style={{ fontSize: 10, color: t.textVeryFaint, letterSpacing: "0.1em", textTransform: "uppercase", marginRight: 4 }}>Percentiles</span>
                         {[5, 10, 25, 50, 75, 95].map((p) => {
                           const active = mcPercentiles.includes(p);
@@ -781,11 +933,15 @@ export default function FIREApp() {
                 <div style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: 12, padding: "16px 20px", fontSize: 13, color: t.textFaint, fontStyle: "italic", lineHeight: 1.7 }}>
                   {showMC && mcResults ? (
                     <>
-                      Based on {mcSimCount.toLocaleString()} simulations using historical S&P 500 returns (1928–2024),{" "}
-                      <span style={{ color: successRateColor(mcResults.successRate), fontStyle: "normal", fontWeight: 700 }}>{Math.round(mcResults.successRate * 100)}%</span>{" "}
-                      of retirement paths succeeded without depleting the portfolio.{" "}
-                      {mcResults.successRate >= 0.9 ? "Your plan is historically robust." : mcResults.successRate >= 0.75 ? "Consider increasing savings or reducing spending to improve resilience." : "Your plan may be underfunded — consider a higher savings rate or later retirement age."}
-                      {" "}The shaded bands show the 5th–95th percentile range across all simulations. The{" "}
+                      Based on {mcSimCount.toLocaleString()} simulations using bootstrapped nominal S&P 500 annual returns (1928–2024),{" "}
+                      <span style={{ color: successRateColor(mcResults.overallSuccessRate), fontStyle: "normal", fontWeight: 700 }}>{Math.round(mcResults.overallSuccessRate * 100)}%</span>{" "}
+                      of all paths both reached FIRE and lasted through age {maxAge}.{" "}
+                      <span style={{ color: t.accent, fontStyle: "normal", fontWeight: 700 }}>{Math.round(mcResults.reachFireRate * 100)}%</span>{" "}
+                      reached FIRE at all, and{" "}
+                      <span style={{ color: t.blue, fontStyle: "normal", fontWeight: 700 }}>{Math.round(mcResults.surviveAfterFireRate * 100)}%</span>{" "}
+                      of those successful retirements avoided depletion.{" "}
+                      {mcResults.overallSuccessRate >= 0.9 ? "Your plan is historically robust." : mcResults.overallSuccessRate >= 0.75 ? "Consider increasing savings or reducing spending to improve resilience." : "Your plan may be underfunded — consider a higher savings rate or later retirement age."}
+                      {" "}The shaded bands show the 5th–95th percentile range across all simulations, and the dashed line is the inflation-adjusted FIRE target for each future year. The{" "}
                       <span style={{ color: t.accent, fontStyle: "normal" }}>Portfolio Growth</span> slider is not used in Monte Carlo mode — historical returns replace it.
                     </>
                   ) : fireAge ? (
